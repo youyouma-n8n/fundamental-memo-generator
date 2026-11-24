@@ -1,0 +1,22 @@
+## 1. Schemas, Forward Ingestion & 3-Year Historical Trajectory (`schemas.py`, `data_fetcher.py`, `mock_market_data.json`)
+
+- [x] 1.1 Add `HistoricalYearPoint`, `FinancialSnapshot` fields (`forward_pe`, `forward_ev_ebitda`, `analyst_target_mean`, `analyst_count`, `historical_trajectory`), `PeerComparable.forward_pe`, and `ValuationAnalysis` fields (`peer_median_forward_pe`, `implied_y5_fcf`, `implied_y5_fcf_multiple`, `implied_y5_fcf_vs_current_revenue`) in `fundamental_memo/src/fundamental_memo/schemas.py` (re-exporting `HistoricalYearPoint` in `__init__.py`); verify `ruff` and `mypy --strict` pass on `schemas.py`.
+- [x] 1.2 Update `fundamental_memo/src/fundamental_memo/data_fetcher.py` to ingest `forwardPE`, `targetMeanPrice`, `numberOfAnalystOpinions`, peer `forwardPE`, and extract up to 3 chronological fiscal years (`period`, `revenue`, `operating_margin`, `free_cash_flow`) into `historical_trajectory`, and populate realistic 3-year historical trajectory + forward/consensus fields in `fundamental_memo/src/fundamental_memo/fixtures/mock_market_data.json`; verify via unit tests in `test_data_fetcher.py`.
+
+## 2. Forward Multiples & Reverse DCF Year-5 FCF Math (`valuation_engine.py`)
+
+- [x] 2.1 Extend `compute_target_multiples(...)` with `forward_pe`, `forward_ev_ebitda`, and `pe_compression_pct = (forward_pe - pe_ratio) / pe_ratio`, compute `peer_median_forward_pe`, and compute Reverse DCF Year-5 FCF metrics (`implied_y5_fcf`, `implied_y5_fcf_multiple`, `implied_y5_fcf_vs_current_revenue`) in `fundamental_memo/src/fundamental_memo/valuation_engine.py`; verify `implied_y5_fcf` matches `free_cash_flow_ttm * (1 + implied_fcf_cagr_5y)**5` within `±$0.01B` and `pe_compression_pct` handles `None` cleanly in `test_valuation_engine.py`.
+
+## 3. Strict Opening-Sentence Anti-Echoing & Forward Synthesis (`memo_synthesizer.py`, `renderer.py`)
+
+- [x] 3.1 Upgrade `fundamental_memo/src/fundamental_memo/memo_synthesizer.py` with a deterministic opening-sentence anti-echoing check in `verify_memo_grounding_and_repetition(...)` (rejecting `valuation_and_debate` or `profitability_and_cash_quality` paragraphs that open by reciting header/ribbon metrics), strengthen LLM prompts for Forward vs. Trailing multiple compression and `analyst_target_mean`, and update `synthesize_mock_memo(...)` so both sections open with analytical mechanisms/drivers and reference `forward_pe` and `analyst_target_mean`; verify grounding and anti-echoing checks in `test_synthesizer_and_renderer.py`.
+- [x] 3.2 Add Forward P/E (Target vs. Peer Median) and Consensus Target context to the Markdown valuation table in `fundamental_memo/src/fundamental_memo/renderer.py`; verify rendered output passes grounding and word-limit checks (`<= 750` words) in `test_synthesizer_and_renderer.py`.
+
+## 4. Charts & Streamlit Scenario Presets UI (`charts.py`, `streamlit_app.py`)
+
+- [x] 4.1 Update `build_valuation_football_field(...)` in `fundamental_memo/src/fundamental_memo/charts.py` to overlay a vertical dotted `#38BDF8` `Analyst Consensus Target` line and non-overlapping annotation when `analyst_target_mean` is available, and implement `build_historical_trajectory_chart(...)` (dual-axis Plotly combo chart: `Revenue ($B)` bars in `#3B82F6` + `Operating Margin (%)` line overlay in `#F59E0B`); verify both charts in `test_charts.py`.
+- [x] 4.2 Upgrade `fundamental_memo/src/fundamental_memo/streamlit_app.py` with a 3-column `Bear | Base | Bull` preset bar at the top of `DCF assumptions` using `st.session_state` callbacks (updating WACC, Terminal g, 5Y FCF CAGR, and Exit EV/EBITDA immediately), a `Reverse DCF Reality Check` callout card (`st.info`) directly above/beside the 5×5 sensitivity matrix, and the 3-Year Historical Trajectory chart with an FCF progression caption; verify preset clicks, Reality Check callout, and trajectory chart via Streamlit `AppTest` in `test_cli_e2e.py`.
+
+## 5. Comprehensive Verification Pass
+
+- [x] 5.1 Expand `fundamental_memo/tests/` (`test_data_fetcher.py`, `test_valuation_engine.py`, `test_synthesizer_and_renderer.py`, `test_charts.py`, `test_cli_e2e.py`) to verify all five acceptance criteria (Bear/Base/Bull preset state updates, 3-year `historical_trajectory` in live-extraction and offline mock modes, `implied_y5_fcf` accuracy within `$0.01B`, opening-sentence anti-echoing rejection and compliance, and `Grounding Audit: Passed` across all new metrics), then run `ruff check src tests`, `mypy src tests`, and `pytest -v` confirming zero warnings or failures.
