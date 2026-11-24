@@ -550,25 +550,25 @@ def build_synthesis_user_prompt(
             "OCF/Net Income using ocf_net_income_gap_driver." + amortization_guidance
         ),
         "bull_case": [
-            "exact 3 concise bullets, target 45-65 words total (STRICT HARD MAX 90 words); MUST "
-            "synthesize at least one concrete segment/product driver from "
-            "financial_snapshot.business_summary alongside margin/ROIC durability. FORBIDDEN: "
-            "repeating exact DCF/Comps share prices or implied_fcf_cagr_5y."
+            "exact 3 short bullets (MAX 20 words per bullet, target 45-60 words total; STRICT "
+            "HARD MAX 90 words total); MUST synthesize at least one concrete segment/product "
+            "driver from financial_snapshot.business_summary alongside margin/ROIC durability. "
+            "FORBIDDEN: repeating exact DCF/Comps share prices or implied_fcf_cagr_5y."
         ],
         "bear_case": [
-            "exact 3 concise bullets, target 45-65 words total (STRICT HARD MAX 90 words); MUST "
-            "cite at least one concrete segment/demand risk from "
+            "exact 3 short bullets (MAX 20 words per bullet, target 45-60 words total; STRICT "
+            "HARD MAX 90 words total); MUST cite at least one concrete segment/demand risk from "
             "financial_snapshot.business_summary alongside multiple compression, growth "
             "deceleration vs. market expectations, and peer dispersion. FORBIDDEN: repeating "
             "exact DCF/Comps share prices or implied_fcf_cagr_5y."
         ],
         "key_downside_risks": [
-            "3 to 4 concise bullets, target 45-65 words total (STRICT HARD MAX 90 words); "
-            "actionable monitoring triggers citing ONLY exact Audit Trail baseline metrics "
-            "(current operating margin, DSO/DIO days, or +50/+100 bps WACC shift). For "
-            "discount-rate risk, cite ONLY the WACC % / bps shift — NEVER write dollar "
-            "DCF/Comps prices or implied CAGR in key_downside_risks, and NEVER invent round "
-            "thresholds like 30%."
+            "3 to 4 short bullets (MAX 18 words per bullet, target 45-60 words total; STRICT "
+            "HARD MAX 90 words total); actionable monitoring triggers citing ONLY exact Audit "
+            "Trail baseline metrics (current operating margin, DSO/DIO days, or +50/+100 bps "
+            "WACC shift). For discount-rate risk, cite ONLY the WACC % / bps shift — NEVER "
+            "write dollar DCF/Comps prices or implied CAGR in key_downside_risks, and NEVER "
+            "invent round thresholds like 30%."
         ],
     }
     return (
@@ -579,6 +579,106 @@ def build_synthesis_user_prompt(
         f"REQUIRED_OUTPUT_SCHEMA:\n{json.dumps(schema_instructions, indent=2)}\n\n"
         "Return raw JSON only with no additional keys or surrounding commentary."
     )
+
+
+_LOSSLESS_SHORTHAND_SUBSTITUTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bstock-based compensation\b", re.IGNORECASE), "SBC"),
+    (re.compile(r"\breturn on invested capital\b", re.IGNORECASE), "ROIC"),
+    (re.compile(r"\btrailing twelve[- ]month(?:s)?\b", re.IGNORECASE), "TTM"),
+    (re.compile(r"\boperating cash flow\b", re.IGNORECASE), "OCF"),
+    (re.compile(r"\bfree cash flow\b", re.IGNORECASE), "FCF"),
+    (re.compile(r"\bcapital expenditures?\b", re.IGNORECASE), "CapEx"),
+    (re.compile(r"\bdays sales outstanding\b", re.IGNORECASE), "DSO"),
+    (re.compile(r"\bdays inventory outstanding\b", re.IGNORECASE), "DIO"),
+    (re.compile(r"\benterprise value\b", re.IGNORECASE), "EV"),
+    (re.compile(r"\bpercentage points?\b", re.IGNORECASE), "pp"),
+    (re.compile(r"\byear-over-year\b", re.IGNORECASE), "YoY"),
+    (re.compile(r"\bquarter-over-quarter\b", re.IGNORECASE), "QoQ"),
+    (re.compile(r"\bdue to the fact that\b", re.IGNORECASE), "as"),
+    (re.compile(r"\bin order to\b", re.IGNORECASE), "to"),
+    (re.compile(r"\bcompared to\b", re.IGNORECASE), "vs."),
+    (re.compile(r"\bcompared with\b", re.IGNORECASE), "vs."),
+    (re.compile(r"\bversus\b", re.IGNORECASE), "vs."),
+)
+
+_FIELD_WORD_LIMITS: dict[str, int] = {
+    "executive_thesis": 60,
+    "valuation_and_debate": 150,
+    "profitability_and_cash_quality": 120,
+    "bull_case": 90,
+    "bear_case": 90,
+    "key_downside_risks": 90,
+}
+
+
+def _apply_lossless_shorthand(text: str) -> str:
+    """Condense verbose institutional phrases into standard finance shorthand losslessly."""
+    result = text
+    for pattern, replacement in _LOSSLESS_SHORTHAND_SUBSTITUTIONS:
+        result = pattern.sub(replacement, result)
+    return " ".join(result.split())
+
+
+def _condense_overflowing_json_fields(cleaned_json: str) -> dict[str, Any] | None:
+    """Apply lossless institutional shorthand ONLY to fields exceeding their schema word limit."""
+    try:
+        parsed = json.loads(cleaned_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+
+    modified = False
+    for field_name, limit in _FIELD_WORD_LIMITS.items():
+        val = parsed.get(field_name)
+        if isinstance(val, str) and len(val.split()) > limit:
+            condensed = _apply_lossless_shorthand(val)
+            if condensed != val:
+                parsed[field_name] = condensed
+                modified = True
+        elif (
+            isinstance(val, list)
+            and all(isinstance(item, str) for item in val)
+            and sum(len(item.split()) for item in val) > limit
+        ):
+            condensed_list = [_apply_lossless_shorthand(item) for item in val]
+            if condensed_list != val:
+                parsed[field_name] = condensed_list
+                modified = True
+    return parsed if modified else None
+
+
+def _describe_word_overflows(cleaned_json: str) -> str:
+    """Build an exact per-field / per-bullet word count breakdown for surgical LLM retries."""
+    try:
+        parsed = json.loads(cleaned_json)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    details: list[str] = []
+    for field_name, limit in _FIELD_WORD_LIMITS.items():
+        val = parsed.get(field_name)
+        if isinstance(val, str):
+            wc = len(val.split())
+            if wc > limit:
+                target = max(limit - 20, 25)
+                details.append(
+                    f"- {field_name}: currently {wc} words (hard cap {limit}) -> rewrite under "
+                    f"{target} words."
+                )
+        elif isinstance(val, list) and all(isinstance(item, str) for item in val):
+            counts = [len(item.split()) for item in val]
+            total = sum(counts)
+            if total > limit:
+                bullet_str = ", ".join(f"bullet {i + 1}: {c}w" for i, c in enumerate(counts))
+                per_bullet_target = max((limit - 25) // max(len(counts), 1), 12)
+                details.append(
+                    f"- {field_name}: currently {total} words [{bullet_str}] (hard cap {limit}) "
+                    f"-> shorten EACH bullet to under {per_bullet_target} words so the total is "
+                    f"under {limit - 25} words."
+                )
+    return "\n".join(details)
 
 
 def synthesize_memo_with_llm(
@@ -618,7 +718,7 @@ def synthesize_memo_with_llm(
         )
     )
 
-    messages: list[dict[str, str]] = [
+    base_messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
@@ -627,6 +727,7 @@ def synthesize_memo_with_llm(
             ),
         },
     ]
+    messages: list[dict[str, str]] = list(base_messages)
 
     last_error_message = "No response received from model."
     last_error_is_grounding = False
@@ -668,12 +769,27 @@ def synthesize_memo_with_llm(
             ) from exc
 
         cleaned_json = _strip_markdown_fences(raw_content)
+        memo: InvestmentMemoSchema | None = None
         try:
             memo = InvestmentMemoSchema.model_validate_json(cleaned_json)
         except ValidationError as exc:
-            last_error_message = str(exc)
-            last_error_is_grounding = False
-        else:
+            # If only a word-limit overshoot occurred, try lossless institutional shorthand first.
+            if "word" in str(exc).lower():
+                condensed_dict = _condense_overflowing_json_fields(cleaned_json)
+                if condensed_dict is not None:
+                    try:
+                        memo = InvestmentMemoSchema.model_validate(condensed_dict)
+                    except ValidationError as exc2:
+                        last_error_message = str(exc2)
+                        last_error_is_grounding = False
+                else:
+                    last_error_message = str(exc)
+                    last_error_is_grounding = False
+            else:
+                last_error_message = str(exc)
+                last_error_is_grounding = False
+
+        if memo is not None:
             audit_payload = build_audit_trail_payload(
                 snapshot, valuation, peers, sensitivity=sensitivity
             )
@@ -689,15 +805,21 @@ def synthesize_memo_with_llm(
             last_error_is_grounding = True
 
         if attempt < total_attempts:
-            messages.append({"role": "assistant", "content": raw_content})
             if not last_error_is_grounding and "word" in last_error_message.lower():
+                overflow_breakdown = _describe_word_overflows(cleaned_json)
+                breakdown_block = (
+                    f"\nExact word counts:\n{overflow_breakdown}\n"
+                    if overflow_breakdown
+                    else ""
+                )
                 retry_instruction = (
                     "Your previous JSON failed ONLY a strict word-count ceiling:\n"
-                    f"{last_error_message}\n\n"
+                    f"{last_error_message}\n{breakdown_block}\n"
                     "Keep all other valid fields UNCHANGED and rewrite ONLY the overflowing "
                     "field(s) to be at least 20 words shorter (for executive_thesis, write at "
-                    "most 2 crisp sentences totaling under 40 words) while citing ONLY the same "
-                    "verified Audit Trail numbers. Return valid raw JSON only."
+                    "most 2 crisp sentences under 40 words; for any overflowing bullet list, keep "
+                    "EACH bullet under 18 words so the list totals under 60 words) while citing "
+                    "ONLY the same verified Audit Trail numbers. Return valid raw JSON only."
                 )
             else:
                 retry_instruction = (
@@ -715,7 +837,13 @@ def synthesize_memo_with_llm(
                     "valuation_and_debate and profitability_and_cash_quality open with an "
                     "analytical driver rather than a header metric. Return valid raw JSON only."
                 )
-            messages.append({"role": "user", "content": retry_instruction})
+            # Keep context tight (base prompt + only the latest attempt) to avoid anchoring on
+            # multiple prior failed JSON drafts.
+            messages = [
+                *base_messages,
+                {"role": "assistant", "content": raw_content},
+                {"role": "user", "content": retry_instruction},
+            ]
 
     error_cls = GroundingAuditError if last_error_is_grounding else SynthesisError
     raise error_cls(

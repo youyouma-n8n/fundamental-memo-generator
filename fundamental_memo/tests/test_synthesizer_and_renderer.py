@@ -229,6 +229,48 @@ def test_llm_synthesizer_uses_surgical_retry_on_word_limit_overflow() -> None:
     retry_prompt = fake_client.completions.calls[1][-1]["content"]
     assert "word-count ceiling" in retry_prompt
     assert "at least 20 words shorter" in retry_prompt
+    assert "currently 61 words" in retry_prompt
+
+
+def test_llm_synthesizer_condenses_slight_bullet_word_overflow_losslessly() -> None:
+    """A 91-word bear_case with verbose phrases condenses cleanly under 90 without a retry."""
+    bundle = load_mock_market_data()
+    valuation = run_valuation_analysis(bundle.snapshot, bundle.peers)
+    valid_output = synthesize_mock_memo(bundle.snapshot, valuation, bundle.peers)
+
+    slightly_over_bear = [
+        (
+            "Demand risk across custom AI accelerators and Ethernet switches could slow "
+            "trailing twelve-month free cash flow conversion compared to elevated market "
+            "expectations and compress return on invested capital materially across cycles."
+        ),
+        (
+            "Rising stock-based compensation and capital expenditures could weigh on "
+            "operating cash flow compared with peers if hyperscale orders pause across "
+            "enterprise networking and broadband carrier customers globally."
+        ),
+        (
+            "Multiple compression risk persists because enterprise value to EBITDA sits at "
+            "a premium versus peers while net cash remains deeply negative due to the fact that "
+            "total debt stays elevated relative to liquid cash reserves."
+        ),
+    ]
+    assert sum(len(b.split()) for b in slightly_over_bear) > 90
+    over_payload = valid_output.model_dump()
+    over_payload["bear_case"] = slightly_over_bear
+
+    fake_client = _FakeOpenAIClient([json.dumps(over_payload)])
+    result = synthesize_memo_with_llm(
+        bundle.snapshot,
+        valuation,
+        bundle.peers,
+        max_retries=2,
+        client=fake_client,
+    )
+    assert len(fake_client.completions.calls) == 1
+    assert sum(len(b.split()) for b in result.bear_case) <= 90
+    assert any("FCF" in b for b in result.bear_case)
+    assert any("SBC" in b for b in result.bear_case)
 
 
 def test_llm_synthesizer_raises_grounding_error_when_retries_exhausted() -> None:
