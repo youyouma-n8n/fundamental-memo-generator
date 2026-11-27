@@ -20,6 +20,9 @@ htmlcov/
 memo_*.md
 report_*.html
 
+# Streamlit local secrets (never commit API keys)
+.streamlit/secrets.toml
+
 # macOS & editor files
 .DS_Store
 ._*

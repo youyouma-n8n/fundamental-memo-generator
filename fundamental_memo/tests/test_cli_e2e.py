@@ -4,17 +4,33 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+import pytest
+import tomllib  # type: ignore[import-untyped]
 from streamlit.testing.v1 import AppTest
 
+import fundamental_memo.streamlit_app as streamlit_app_mod
 from fundamental_memo.cli import run_memo_pipeline
 from fundamental_memo.data_fetcher import load_mock_market_data
-from fundamental_memo.memo_synthesizer import DEFAULT_BASE_URL, SUPPORTED_MODELS
-from fundamental_memo.schemas import count_words
+from fundamental_memo.deterministic_memo import (
+    DETERMINISTIC_MODE_LABEL,
+    GROQ_BASE_URL,
+    GROQ_CUSTOM_MODEL_OPTION,
+    GROQ_MODEL_PRESETS,
+    LLM_PROVIDERS,
+    OLLAMA_DEFAULT_MODEL,
+    PROVIDER_GROQ,
+    PROVIDER_OLLAMA,
+)
+from fundamental_memo.memo_synthesizer import DEFAULT_BASE_URL
+from fundamental_memo.schemas import DataFetchError, SynthesisError, count_words
 from fundamental_memo.streamlit_app import (
+    AUTHOR_ATTRIBUTION,
     MODE_DEEP_DIVE,
     MODE_WATCHLIST,
+    _fetch_bundle_with_cloud_fallback,
     build_quarterly_momentum_dataframe,
     build_styled_watchlist_table,
 )
@@ -96,8 +112,17 @@ def test_cli_invalid_wacc_returns_nonzero_exit(tmp_path: Path) -> None:
     assert not output_file.exists()
 
 
-def test_streamlit_app_controls_kpis_charts_and_offline_generation() -> None:
-    """Verify sidebar controls, 5 KPI cards, Plotly charts, and memo generation in offline mode."""
+def test_streamlit_app_controls_kpis_charts_and_offline_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify hybrid sidebar auto-detect, zero-LLM <2s generation, KPIs, and Plotly charts."""
+    # Simulate Streamlit Community Cloud (localhost:11434 unreachable, no secrets/env)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "fundamental_memo.deterministic_memo.probe_local_llm_endpoint",
+        lambda *_args, **_kwargs: False,
+    )
     app_path = (
         Path(__file__).resolve().parents[1] / "src" / "fundamental_memo" / "streamlit_app.py"
     )
@@ -106,12 +131,50 @@ def test_streamlit_app_controls_kpis_charts_and_offline_generation() -> None:
 
     assert not app_test.exception
 
-    # Verify model dropdown & Ollama base URL
-    assert len(app_test.sidebar.selectbox) == 1
-    model_selector = app_test.sidebar.selectbox[0]
-    assert list(model_selector.options) == list(SUPPORTED_MODELS)
-    assert model_selector.value == "inkling-2-mini:latest"
-    assert app_test.sidebar.text_input[2].value == DEFAULT_BASE_URL
+    # Verify author attribution in both sidebar footer and main page header/footer
+    assert any(AUTHOR_ATTRIBUTION in cap.value for cap in app_test.sidebar.caption)
+    assert any(AUTHOR_ATTRIBUTION in cap.value for cap in app_test.caption)
+
+    # Verify hybrid Narrative Synthesis sidebar defaults to Groq + unchecked when Ollama is offline
+    sidebar_checkboxes = {cb.label: cb for cb in app_test.sidebar.checkbox}
+    assert sidebar_checkboxes["Enable AI Narrative Synthesis (Ollama / Cloud API)"].value is False
+    assert sidebar_checkboxes["Use Offline Mock Data"].value is False
+
+    # Verify LLM Provider & Groq free-tier defaults inside collapsible settings
+    sidebar_selects = {sb.label: sb for sb in app_test.sidebar.selectbox}
+    assert list(sidebar_selects["LLM Provider"].options) == list(LLM_PROVIDERS)
+    assert sidebar_selects["LLM Provider"].value == PROVIDER_GROQ
+    assert list(sidebar_selects["Model"].options) == list(GROQ_MODEL_PRESETS)
+    assert sidebar_selects["Model"].value == "llama-3.3-70b-versatile"
+    base_url_inputs = [ti for ti in app_test.sidebar.text_input if ti.label == "Base URL"]
+    assert len(base_url_inputs) == 1
+    assert base_url_inputs[0].value == GROQ_BASE_URL
+    assert any(ti.label == "Groq API Key" for ti in app_test.sidebar.text_input)
+
+    # Selecting Custom model ID... reveals a text input for arbitrary Groq model slugs
+    sidebar_selects["Model"].select(GROQ_CUSTOM_MODEL_OPTION)
+    app_test.run(timeout=20)
+    assert not app_test.exception
+    assert any(ti.label == "Custom Groq Model ID" for ti in app_test.sidebar.text_input)
+
+    # Enabling AI synthesis with blank Groq key shows inline sidebar warning
+    sidebar_checkboxes = {cb.label: cb for cb in app_test.sidebar.checkbox}
+    sidebar_checkboxes["Enable AI Narrative Synthesis (Ollama / Cloud API)"].check()
+    app_test.run(timeout=20)
+    assert not app_test.exception
+    assert any("Groq API key" in w.value for w in app_test.sidebar.warning)
+
+    # Switching to Local Ollama preserves localhost:11434 and qwen3.8:27b-mlx defaults
+    sidebar_selects = {sb.label: sb for sb in app_test.sidebar.selectbox}
+    sidebar_selects["LLM Provider"].select(PROVIDER_OLLAMA)
+    sidebar_checkboxes = {cb.label: cb for cb in app_test.sidebar.checkbox}
+    sidebar_checkboxes["Enable AI Narrative Synthesis (Ollama / Cloud API)"].uncheck()
+    app_test.run(timeout=20)
+    assert not app_test.exception
+    ollama_base_urls = [ti for ti in app_test.sidebar.text_input if ti.label == "Base URL"]
+    assert ollama_base_urls[0].value == DEFAULT_BASE_URL
+    ollama_model_select = {sb.label: sb for sb in app_test.sidebar.selectbox}["Model"]
+    assert ollama_model_select.value == OLLAMA_DEFAULT_MODEL
 
     # Verify Bear / Base / Bull scenario presets update all 4 DCF inputs in st.session_state
     preset_buttons = {btn.label: btn for btn in app_test.sidebar.button}
@@ -144,14 +207,17 @@ def test_streamlit_app_controls_kpis_charts_and_offline_generation() -> None:
     assert num_inputs["5Y FCF CAGR"] == 0.15
     assert num_inputs["Terminal Exit EV/EBITDA Multiple"] == 15.0
 
-    # Select gemma4:31b-mlx, toggle offline mock mode, and trigger generation.
-    app_test.sidebar.selectbox[0].select("gemma4:31b-mlx")
-    app_test.sidebar.checkbox[0].check()
+    # Enable offline mock data and run Zero-LLM Deterministic Rule Engine (< 2s)
+    offline_cb = {cb.label: cb for cb in app_test.sidebar.checkbox}["Use Offline Mock Data"]
+    offline_cb.check()
+    t0 = time.perf_counter()
     gen_buttons = {btn.label: btn for btn in app_test.sidebar.button}
     gen_buttons["Generate one-page memo"].click()
     app_test.run(timeout=20)
+    elapsed = time.perf_counter() - t0
 
     assert not app_test.exception
+    assert elapsed < 5.0
     # Verify 5 non-truncating KPI metric cards
     assert len(app_test.metric) == 5
     metric_labels = [metric.label for metric in app_test.metric]
@@ -162,7 +228,11 @@ def test_streamlit_app_controls_kpis_charts_and_offline_generation() -> None:
         "ROIC (TTM)",
         "Earnings Quality",
     ]
-    # Verify Reverse DCF Reality Check callout, 5x5 sensitivity table, 4Q momentum tab & caption
+    # Verify Deterministic Rule Engine mode badge, Reverse DCF callout, 5x5 matrix, 4Q momentum
+    assert any(
+        DETERMINISTIC_MODE_LABEL in cap.value and "Grounding Audit: **Passed**" in cap.value
+        for cap in app_test.caption
+    )
     assert any("Reverse DCF" in info.title or "5Y FCF CAGR" in info.value for info in app_test.info)
     assert len(app_test.dataframe) >= 2
     assert any(
@@ -217,7 +287,9 @@ def test_streamlit_watchlist_screener_and_one_click_deep_dive_handoff() -> None:
     assert not app_test.exception
 
     # Enable offline mock mode in sidebar and switch to Watchlist Quick-Scan Screener
-    app_test.sidebar.checkbox[0].check()
+    sidebar_cbs = {cb.label: cb for cb in app_test.sidebar.checkbox}
+    sidebar_cbs["Enable AI Narrative Synthesis (Ollama / Cloud API)"].uncheck()
+    sidebar_cbs["Use Offline Mock Data"].check()
     app_test.session_state["active_mode"] = MODE_WATCHLIST
     app_test.run(timeout=20)
     assert not app_test.exception
@@ -251,3 +323,109 @@ def test_streamlit_watchlist_screener_and_one_click_deep_dive_handoff() -> None:
     scan = run_watchlist_scan(["NVDA", "AVGO"], offline_mock=True)
     styler = build_styled_watchlist_table(scan)
     assert list(styler.data["Ticker"]) == ["NVDA", "AVGO"]
+
+
+def test_cloud_yfinance_fallback_loads_demo_profile_on_throttling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live yfinance throttling on supported demo tickers falls back cleanly with a notice."""
+
+    def _raise_throttle(*_args: object, **_kwargs: object) -> object:
+        raise DataFetchError("429 Too Many Requests")
+
+    monkeypatch.setattr(streamlit_app_mod, "_cached_fetch_live_bundle", _raise_throttle)
+    bundle, notice = _fetch_bundle_with_cloud_fallback(
+        "NVDA", ["AMD", "AVGO"], use_mock_data=False
+    )
+    assert bundle.snapshot.ticker == "NVDA"
+    assert notice is not None
+    assert "temporarily unavailable" in notice
+
+    with pytest.raises(DataFetchError):
+        _fetch_bundle_with_cloud_fallback("UNSUPPORTED_TICKER", [], use_mock_data=False)
+
+
+def test_streamlit_cloud_deployment_artifacts_are_valid() -> None:
+    """Root requirements.txt and .streamlit/config.toml exist and parse cleanly."""
+    repo_root = Path(__file__).resolve().parents[2]
+    req_file = repo_root / "requirements.txt"
+    toml_file = repo_root / ".streamlit" / "config.toml"
+
+    assert req_file.exists()
+    req_text = req_file.read_text(encoding="utf-8")
+    for expected in (
+        "streamlit>=",
+        "yfinance>=",
+        "pandas>=",
+        "numpy>=",
+        "scipy>=",
+        "plotly>=",
+        "pydantic>=",
+        "openai>=",
+        "markdown>=",
+        "-e ./fundamental_memo",
+    ):
+        assert expected in req_text
+
+    assert toml_file.exists()
+    config = tomllib.loads(toml_file.read_text(encoding="utf-8"))
+    assert config["theme"]["base"] == "dark"
+    assert config["theme"]["primaryColor"] == "#3B82F6"
+    assert config["theme"]["backgroundColor"] == "#0E1117"
+    assert config["theme"]["secondaryBackgroundColor"] == "#161B22"
+    assert config["theme"]["textColor"] == "#F8FAFC"
+    assert config["server"]["headless"] is True
+
+    # Linux-safe requirements: zero Apple Silicon mlx dependencies
+    for line in req_text.splitlines():
+        normalized = line.strip().lower()
+        assert not normalized.startswith("mlx")
+
+    # Local Streamlit secrets must be excluded from Git tracking
+    gitignore_file = repo_root / ".gitignore"
+    assert gitignore_file.exists()
+    assert ".streamlit/secrets.toml" in gitignore_file.read_text(encoding="utf-8")
+
+
+def test_streamlit_groq_401_error_shows_warning_and_preserves_charts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid Groq key (401) renders a clear warning while keeping KPIs, charts, and memo."""
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "fundamental_memo.deterministic_memo.probe_local_llm_endpoint",
+        lambda *_args, **_kwargs: False,
+    )
+
+    def _raise_401(*_args: object, **_kwargs: object) -> object:
+        raise SynthesisError(
+            "LLM authentication failed (401 Unauthorized) at 'https://api.groq.com/openai/v1'"
+        )
+
+    monkeypatch.setattr("fundamental_memo.deterministic_memo.synthesize_memo_with_llm", _raise_401)
+
+    app_path = (
+        Path(__file__).resolve().parents[1] / "src" / "fundamental_memo" / "streamlit_app.py"
+    )
+    app_test = AppTest.from_file(str(app_path))
+    app_test.run(timeout=20)
+    assert not app_test.exception
+
+    # Enable AI synthesis with Groq + dummy key + offline mock data and trigger generation
+    cbs = {cb.label: cb for cb in app_test.sidebar.checkbox}
+    cbs["Enable AI Narrative Synthesis (Ollama / Cloud API)"].check()
+    cbs["Use Offline Mock Data"].check()
+    key_input = [ti for ti in app_test.sidebar.text_input if ti.label == "Groq API Key"][0]
+    key_input.input("gsk_invalid_test_key")
+    gen_btn = {btn.label: btn for btn in app_test.sidebar.button}["Generate one-page memo"]
+    gen_btn.click()
+    app_test.run(timeout=20)
+
+    assert not app_test.exception
+    assert any("401 Unauthorized" in w.value for w in app_test.warning)
+    # All quantitative cards, tables, grounded memo, and author attribution remain intact
+    assert len(app_test.metric) == 5
+    assert len(app_test.dataframe) >= 2
+    assert any("Investment Memo: Broadcom Inc. (AVGO)" in md.value for md in app_test.markdown)
+    assert any(AUTHOR_ATTRIBUTION in cap.value for cap in app_test.caption)

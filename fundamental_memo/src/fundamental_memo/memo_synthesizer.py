@@ -8,7 +8,15 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from openai import APIConnectionError, APIError, APITimeoutError, BadRequestError, OpenAI
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    OpenAI,
+    RateLimitError,
+)
 from pydantic import ValidationError
 
 from fundamental_memo.schemas import (
@@ -317,23 +325,33 @@ def _count_formatted_value_mentions(text: str, value: float, *, is_percentage: b
     with a multiple (e.g., 28.2x Forward P/E) or a different decimal number sharing an integer part.
     """
     target = abs(value * 100.0) if is_percentage else abs(value)
-    patterns: set[str] = {
+    decimal_patterns: set[str] = {
         f"{target:,.2f}",
         f"{target:.2f}",
         f"{target:,.1f}",
         f"{target:.1f}",
     }
-    if target >= 10.0:
-        patterns.add(f"{target:,.0f}")
-    escaped = "|".join(re.escape(item) for item in sorted(patterns, key=len, reverse=True))
     if is_percentage:
+        pct_patterns = set(decimal_patterns)
+        if target >= 10.0:
+            pct_patterns.add(f"{target:,.0f}")
+        escaped = "|".join(re.escape(item) for item in sorted(pct_patterns, key=len, reverse=True))
         regex = re.compile(
             rf"(?<!\d)(?<!\d\.)(?:{escaped})(?!\d|\.\d)\s*(?:%|pp\b)", re.IGNORECASE
         )
     else:
-        regex = re.compile(
-            rf"(?<!\d)(?<!\d\.)\$?(?:{escaped})(?!\d|\.\d)(?!\s*[%x])", re.IGNORECASE
+        escaped_dec = "|".join(
+            re.escape(item) for item in sorted(decimal_patterns, key=len, reverse=True)
         )
+        unit_exclusion = r"(?!\d|\.\d)(?!\s*(?:%|x|×|bps\b|pp\b|days?\b))"
+        if target >= 10.0:
+            int_token = re.escape(f"{target:,.0f}")
+            pattern_str = (
+                rf"(?<!\d)(?<!\d\.)(?:\$?(?:{escaped_dec})|\${int_token}){unit_exclusion}"
+            )
+        else:
+            pattern_str = rf"(?<!\d)(?<!\d\.)\$?(?:{escaped_dec}){unit_exclusion}"
+        regex = re.compile(pattern_str, re.IGNORECASE)
     return len(regex.findall(text))
 
 
@@ -681,6 +699,21 @@ def _describe_word_overflows(cleaned_json: str) -> str:
     return "\n".join(details)
 
 
+def _should_send_reasoning_effort(base_url: str, model: str, disable_thinking: bool) -> bool:
+    """Return True only when ``reasoning_effort="none"`` should be sent to the endpoint.
+
+    Non-reasoning Groq models (e.g. ``llama-3.3-70b-versatile``, ``llama-3.1-8b-instant``)
+    reject ``reasoning_effort`` with HTTP 400; skipping it upfront avoids wasting a
+    free-tier RPM call on every synthesis request.
+    """
+    if not disable_thinking:
+        return False
+    if "api.groq.com" in base_url.lower():
+        model_lower = model.lower()
+        return any(token in model_lower for token in ("qwen3", "gpt-oss", "deepseek-r1"))
+    return True
+
+
 def synthesize_memo_with_llm(
     snapshot: FinancialSnapshot,
     valuation: ValuationAnalysis,
@@ -732,7 +765,7 @@ def synthesize_memo_with_llm(
     last_error_message = "No response received from model."
     last_error_is_grounding = False
     total_attempts = max_retries + 1
-    use_reasoning_override = disable_thinking
+    use_reasoning_override = _should_send_reasoning_effort(base_url, model, disable_thinking)
 
     for attempt in range(1, total_attempts + 1):
         create_kwargs: dict[str, Any] = {
@@ -755,17 +788,27 @@ def synthesize_memo_with_llm(
                 create_kwargs.pop("reasoning_effort", None)
                 response = openai_client.chat.completions.create(**create_kwargs)
             raw_content = response.choices[0].message.content or ""
+        except AuthenticationError as exc:
+            raise SynthesisError(
+                f"LLM authentication failed (401 Unauthorized) at '{base_url}' "
+                f"for model '{model}': invalid or missing API key. Details: {exc}"
+            ) from exc
+        except RateLimitError as exc:
+            raise SynthesisError(
+                f"LLM rate limit exceeded (429 Too Many Requests) at '{base_url}' "
+                f"for model '{model}': free-tier quota or RPM limit reached. Details: {exc}"
+            ) from exc
         except (APIConnectionError, APITimeoutError) as exc:
             raise SynthesisError(
-                f"Unable to reach local LLM endpoint at '{base_url}' for model '{model}': {exc}"
+                f"Unable to reach LLM endpoint at '{base_url}' for model '{model}': {exc}"
             ) from exc
         except APIError as exc:
             raise SynthesisError(
-                f"Local LLM API error from '{base_url}' for model '{model}': {exc}"
+                f"LLM API error from '{base_url}' for model '{model}': {exc}"
             ) from exc
         except Exception as exc:  # noqa: BLE001
             raise SynthesisError(
-                f"Unexpected error calling local LLM '{model}' at '{base_url}': {exc}"
+                f"Unexpected error calling LLM '{model}' at '{base_url}': {exc}"
             ) from exc
 
         cleaned_json = _strip_markdown_fences(raw_content)

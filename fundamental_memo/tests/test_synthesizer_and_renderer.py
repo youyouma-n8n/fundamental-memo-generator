@@ -6,8 +6,10 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from openai import AuthenticationError, RateLimitError
 
 from fundamental_memo.data_fetcher import load_mock_market_data
+from fundamental_memo.deterministic_memo import GROQ_BASE_URL
 from fundamental_memo.html_exporter import build_html_report
 from fundamental_memo.memo_synthesizer import (
     SYSTEM_PROMPT,
@@ -177,10 +179,11 @@ def test_grounding_verifier_flags_unverified_number_and_repetition() -> None:
 
 
 def test_single_mention_counter_distinguishes_multiples_from_percentages() -> None:
-    """Forward P/E 28.2x must never collide with implied_fcf_cagr_5y 28.4%."""
+    """Forward P/E 28.2x never collides with 28.4% CAGR, and '100 bps' never collides with $100."""
     text = "Forward P/E is 28.2x (peers 28.25x), while Reverse DCF implies 28.4% CAGR."
     assert _count_formatted_value_mentions(text, 0.284, is_percentage=True) == 1
     assert _count_formatted_value_mentions("Target $97.25 vs 97.2% margin.", 97.25) == 1
+    assert _count_formatted_value_mentions("A 100 bps WACC shift vs $100.28 comps.", 100.28) == 1
 
 
 def test_llm_synthesizer_retries_on_grounding_failure_and_recovers() -> None:
@@ -444,3 +447,83 @@ def test_multiplier_noun_guardrail_catches_swapped_fcf_and_revenue_nouns() -> No
         )
         == []
     )
+
+
+def test_groq_llama_skips_reasoning_effort_and_passes_grounding() -> None:
+    """Non-reasoning Groq Llama models omit reasoning_effort to preserve free-tier RPM."""
+    bundle = load_mock_market_data()
+    valuation = run_valuation_analysis(bundle.snapshot, bundle.peers)
+    valid_output = synthesize_mock_memo(bundle.snapshot, valuation, bundle.peers)
+
+    fake_client = _FakeOpenAIClient([valid_output.model_dump_json()])
+    result = synthesize_memo_with_llm(
+        bundle.snapshot,
+        valuation,
+        bundle.peers,
+        model="llama-3.3-70b-versatile",
+        base_url=GROQ_BASE_URL,
+        api_key="gsk_test",
+        client=fake_client,
+    )
+    assert result == valid_output
+    assert "reasoning_effort" not in fake_client.completions.kwargs_log[0]
+
+    # Groq qwen3 reasoning model keeps reasoning_effort="none"
+    qwen_client = _FakeOpenAIClient([valid_output.model_dump_json()])
+    synthesize_memo_with_llm(
+        bundle.snapshot,
+        valuation,
+        bundle.peers,
+        model="qwen/qwen3-32b",
+        base_url=GROQ_BASE_URL,
+        api_key="gsk_test",
+        client=qwen_client,
+    )
+    assert qwen_client.completions.kwargs_log[0]["reasoning_effort"] == "none"
+
+
+def test_llm_synthesizer_surfaces_explicit_401_and_429_synthesis_errors() -> None:
+    """AuthenticationError (401) and RateLimitError (429) raise explicit SynthesisError."""
+    bundle = load_mock_market_data()
+    valuation = run_valuation_analysis(bundle.snapshot, bundle.peers)
+    fake_req = SimpleNamespace(url=f"{GROQ_BASE_URL}/chat/completions")
+
+    class _ErrClient:
+        def __init__(self, exc: Exception) -> None:
+            self._exc = exc
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, **kwargs: object) -> object:
+            raise self._exc
+
+    auth_err = AuthenticationError(
+        "Invalid API Key",
+        response=SimpleNamespace(status_code=401, headers={}, request=fake_req),  # type: ignore[arg-type]
+        body={"error": {"message": "Invalid API Key"}},
+    )
+    with pytest.raises(SynthesisError, match="401 Unauthorized"):
+        synthesize_memo_with_llm(
+            bundle.snapshot,
+            valuation,
+            bundle.peers,
+            model="llama-3.3-70b-versatile",
+            base_url=GROQ_BASE_URL,
+            api_key="gsk_bad",
+            client=_ErrClient(auth_err),
+        )
+
+    rate_err = RateLimitError(
+        "Rate limit exceeded",
+        response=SimpleNamespace(status_code=429, headers={}, request=fake_req),  # type: ignore[arg-type]
+        body={"error": {"message": "Rate limit reached"}},
+    )
+    with pytest.raises(SynthesisError, match="429 Too Many Requests"):
+        synthesize_memo_with_llm(
+            bundle.snapshot,
+            valuation,
+            bundle.peers,
+            model="llama-3.3-70b-versatile",
+            base_url=GROQ_BASE_URL,
+            api_key="gsk_valid",
+            client=_ErrClient(rate_err),
+        )

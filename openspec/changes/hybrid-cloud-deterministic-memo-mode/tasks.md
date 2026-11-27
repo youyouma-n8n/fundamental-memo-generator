@@ -1,0 +1,16 @@
+## 1. Deterministic Rule-Based Memo Engine & Auto-Fallback
+
+- [x] 1.1 Create `fundamental_memo/src/fundamental_memo/deterministic_memo.py` implementing `probe_local_llm_endpoint(...)` (`< 0.3s` socket health ping), `is_localhost_url(...)`, `build_deterministic_memo_schema(...)` (threshold-driven rules for ROIC > 15%, Forward P/E compression > 20%, Reverse DCF implied CAGR > 25%, amortization spread > 15pp, working-capital DSO/DIO, and WACC sensitivity), `build_deterministic_memo(audit_trail) -> str`, and graceful auto-fallback wrapper `generate_memo(...)`, and re-export key symbols in `__init__.py`; verify via unit tests in `tests/test_deterministic_memo.py` covering Audit Trail -> grounded Markdown (`<= 750` words, zero leaked `snake_case` keys), threshold-specific bullet adaptation, zero-LLM bypass when disabled or missing cloud API key, and graceful fallback on unreachable local LLM.
+- [x] 1.2 Integrate `generate_memo(...)` and optional `use_ai_synthesis`, `api_key`, `allow_llm_fallback`, and `preloaded_bundle` parameters into `run_memo_pipeline(...)` and `PipelineResult` (`synthesis_mode`, `fallback_notice`, `data_fallback_notice`) in `fundamental_memo/src/fundamental_memo/cli.py` while preserving backward-compatible CLI behavior; verify via unit tests in `tests/test_deterministic_memo.py` and `tests/test_cli_e2e.py`.
+
+## 2. Hybrid Streamlit Sidebar & Cloud Data Resilience
+
+- [x] 2.1 Update `fundamental_memo/src/fundamental_memo/streamlit_app.py` to add auto-detected `### Narrative Synthesis` controls (`Enable AI Narrative Synthesis (Ollama / Cloud API)` defaulting to `True` only when `localhost:11434` responds within `< 0.3s`), collapsible `LLM Endpoint & Model Settings` expander (`Base URL`, `Model` selector defaulting to `qwen3.8:27b-mlx` with presets `inkling-2-mini:latest`, `gemma4:31b-mlx`, `gemma4:26b-mlx`, `llama-3.3-70b-versatile` and custom model entry, masked `API Key` reading `st.secrets.get("LLM_API_KEY", "")` safely), status caption showing `Mode: Deterministic Rule Engine (Zero-LLM) | Grounding Audit: Passed` or `AI Synthesis (<model>)`, non-blocking fallback notices, `@st.cache_data(ttl=3600)` live `yfinance` caching, and automatic demo-ticker fallback on live `yfinance` throttling; verify via updated Streamlit `AppTest` checks in `tests/test_cli_e2e.py` simulating offline Ollama (`< 2s` zero-LLM run), demo fallback banner, and zero `use_container_width`.
+
+## 3. Streamlit Community Cloud Deployment Artifacts
+
+- [x] 3.1 Create root `requirements.txt` (pinning `streamlit`, `yfinance`, `pandas`, `numpy`, `scipy`, `plotly`, `pydantic`, `openai`, `markdown`, plus `-e ./fundamental_memo`) and root `.streamlit/config.toml` (dark institutional theme and `headless = true`), and update root `README.md` with Streamlit Community Cloud deployment steps; verify via a unit test validating TOML parsing of `.streamlit/config.toml` and required dependency entries in `requirements.txt`.
+
+## 4. End-to-End Verification
+
+- [x] 4.1 Run full quality gates (`ruff check src tests`, `mypy src tests`, `pytest -v`) inside `fundamental_memo/.venv`, verify sub-2-second zero-LLM memo + Plotly charts + `.md`/`.html` generation when Ollama is stopped/offline, and verify local Ollama auto-detection (`localhost:11434`) preserves the live local LLM workflow cleanly.

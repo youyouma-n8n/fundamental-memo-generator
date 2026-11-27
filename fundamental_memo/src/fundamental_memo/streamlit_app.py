@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -11,32 +13,64 @@ import plotly.graph_objects as go
 import streamlit as st
 from pandas.io.formats.style import Styler
 
-from fundamental_memo.charts import (
+# Ensure fundamental_memo/src is importable when launched directly on Streamlit Community Cloud.
+_SRC_ROOT = str(Path(__file__).resolve().parents[1])
+if _SRC_ROOT not in sys.path:
+    sys.path.insert(0, _SRC_ROOT)
+
+from fundamental_memo.charts import (  # noqa: E402
     build_historical_trajectory_chart,
     build_peer_valuation_scatter,
     build_valuation_football_field,
 )
-from fundamental_memo.cli import PipelineResult, parse_peer_tickers, run_memo_pipeline
-from fundamental_memo.html_exporter import build_html_report
-from fundamental_memo.memo_synthesizer import DEFAULT_BASE_URL, SUPPORTED_MODELS
-from fundamental_memo.renderer import MAX_MEMO_WORDS
-from fundamental_memo.schemas import (
+from fundamental_memo.cli import (  # noqa: E402
+    PipelineResult,
+    parse_peer_tickers,
+    run_memo_pipeline,
+)
+from fundamental_memo.data_fetcher import (  # noqa: E402
+    fetch_financial_snapshot,
+    fetch_market_data,
+    load_mock_market_data,
+)
+from fundamental_memo.deterministic_memo import (  # noqa: E402
+    GROQ_BASE_URL,
+    GROQ_CUSTOM_MODEL_OPTION,
+    GROQ_MODEL_PRESETS,
+    HYBRID_MODEL_PRESETS,
+    LLM_PROVIDERS,
+    OLLAMA_DEFAULT_MODEL,
+    OLLAMA_MODEL_PRESETS,
+    PROVIDER_CUSTOM,
+    PROVIDER_GROQ,
+    PROVIDER_OLLAMA,
+    probe_local_llm_endpoint,
+    resolve_provider_api_key,
+)
+from fundamental_memo.html_exporter import build_html_report  # noqa: E402
+from fundamental_memo.memo_synthesizer import DEFAULT_BASE_URL  # noqa: E402
+from fundamental_memo.renderer import MAX_MEMO_WORDS  # noqa: E402
+from fundamental_memo.schemas import (  # noqa: E402
+    DataFetchError,
     DcfSensitivityMatrix,
     FinancialSnapshot,
     FundamentalMemoError,
+    MarketDataBundle,
     QuarterlyPoint,
 )
-from fundamental_memo.screener import run_watchlist_scan
-from fundamental_memo.valuation_engine import (
+from fundamental_memo.screener import run_watchlist_scan  # noqa: E402
+from fundamental_memo.valuation_engine import (  # noqa: E402
     DEFAULT_EXIT_EV_EBITDA,
     DEFAULT_MAX_FCF_GROWTH,
     DEFAULT_TERMINAL_GROWTH,
     DEFAULT_WACC,
 )
 
-MODEL_OPTIONS: tuple[str, ...] = SUPPORTED_MODELS
+AUTHOR_ATTRIBUTION = "Built by Josh Zhou @ UChicago"
+MODEL_OPTIONS: tuple[str, ...] = HYBRID_MODEL_PRESETS
 MODE_DEEP_DIVE = "Single-Stock Deep-Dive"
 MODE_WATCHLIST = "Watchlist Quick-Scan Screener"
+DEMO_FALLBACK_TICKERS: frozenset[str] = frozenset({"AVGO", "NVDA", "AMD", "MRVL", "QCOM"})
 
 SCENARIO_PRESETS: dict[str, dict[str, float]] = {
     "Bear": {
@@ -60,8 +94,83 @@ SCENARIO_PRESETS: dict[str, dict[str, float]] = {
 }
 
 
+def _lookup_streamlit_secret(secret_name: str) -> str | None:
+    """Safely read a named secret from st.secrets, returning None when secrets.toml is absent."""
+    try:
+        raw_secret = st.secrets.get(secret_name)
+        return str(raw_secret).strip() if raw_secret else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _render_page_footer() -> None:
+    """Render subtle bottom-of-page author attribution without obstructing charts or exports."""
+    st.divider()
+    st.caption(f"{AUTHOR_ATTRIBUTION} · Equity Fundamental Deep-Dive & One-Page Memo Generator")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_fetch_live_bundle(ticker: str, peers_tuple: tuple[str, ...]) -> dict[str, Any]:
+    """Cache live yfinance target + peer bundle for 1 hour to prevent cloud IP throttling."""
+    bundle = fetch_market_data(
+        ticker=ticker,
+        peer_tickers=list(peers_tuple),
+        mock_data=False,
+    )
+    return bundle.model_dump(mode="json", by_alias=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_fetch_live_snapshot(ticker: str) -> dict[str, Any]:
+    """Cache single-ticker live yfinance snapshots for 1 hour for Watchlist Quick-Scan."""
+    snapshot = fetch_financial_snapshot(ticker)
+    return snapshot.model_dump(mode="json", by_alias=True)
+
+
+def _fetch_bundle_with_cloud_fallback(
+    ticker: str,
+    peer_list: Sequence[str],
+    *,
+    use_mock_data: bool,
+) -> tuple[MarketDataBundle, str | None]:
+    """Load market data via offline fixtures or cached yfinance with demo-ticker fallback."""
+    target_symbol = ticker.strip().upper()
+    filtered_peers = [
+        peer.strip().upper()
+        for peer in peer_list
+        if peer.strip() and peer.strip().upper() != target_symbol
+    ]
+    if use_mock_data:
+        return load_mock_market_data(ticker=target_symbol, peer_tickers=filtered_peers), None
+
+    try:
+        cached_payload = _cached_fetch_live_bundle(target_symbol, tuple(filtered_peers))
+        return MarketDataBundle.model_validate(cached_payload), None
+    except DataFetchError:
+        if target_symbol in DEMO_FALLBACK_TICKERS:
+            demo_bundle = load_mock_market_data(ticker=target_symbol, peer_tickers=filtered_peers)
+            notice = (
+                f"Live Yahoo Finance data temporarily unavailable for {target_symbol} "
+                "(rate-limited or offline) — loaded bundled offline demo data instead."
+            )
+            return demo_bundle, notice
+        raise
+
+
+def _cached_watchlist_snapshot_fetcher(symbol: str) -> FinancialSnapshot:
+    """Cached live snapshot loader with demo-ticker fallback for Watchlist Quick-Scan."""
+    normalized = symbol.strip().upper()
+    try:
+        payload = _cached_fetch_live_snapshot(normalized)
+        return FinancialSnapshot.model_validate(payload)
+    except DataFetchError:
+        if normalized in DEMO_FALLBACK_TICKERS:
+            return load_mock_market_data(ticker=normalized).snapshot
+        raise
+
+
 def _init_dcf_session_state() -> None:
-    """Initialize DCF sidebar inputs, target ticker, and workspace mode in st.session_state."""
+    """Initialize DCF inputs, target ticker, workspace mode, and local LLM auto-detection."""
     for key, default_val in SCENARIO_PRESETS["Base"].items():
         if key not in st.session_state:
             st.session_state[key] = default_val
@@ -73,6 +182,20 @@ def _init_dcf_session_state() -> None:
         st.session_state["active_mode"] = MODE_DEEP_DIVE
     if "auto_run_deep_dive" not in st.session_state:
         st.session_state["auto_run_deep_dive"] = False
+    if "local_llm_detected" not in st.session_state:
+        st.session_state["local_llm_detected"] = probe_local_llm_endpoint(
+            DEFAULT_BASE_URL, timeout=0.25
+        )
+    detected_local = bool(st.session_state["local_llm_detected"])
+    if "llm_provider" not in st.session_state:
+        st.session_state["llm_provider"] = (
+            PROVIDER_OLLAMA if detected_local else PROVIDER_GROQ
+        )
+    if "enable_ai_synthesis" not in st.session_state:
+        groq_secret_key, _ = resolve_provider_api_key(
+            PROVIDER_GROQ, "", secrets_lookup=_lookup_streamlit_secret
+        )
+        st.session_state["enable_ai_synthesis"] = detected_local or bool(groq_secret_key)
 
 
 def _apply_scenario_preset(preset_name: str) -> None:
@@ -317,6 +440,9 @@ def _render_watchlist_screener(
                 base_cagr=fcf_cagr,
                 exit_multiple=exit_ev_ebitda,
                 offline_mock=use_mock_data,
+                snapshot_fetcher=(
+                    None if use_mock_data else _cached_watchlist_snapshot_fetcher
+                ),
             )
             elapsed = time.perf_counter() - t0
         st.session_state["watchlist_scan_results"] = scan_results
@@ -381,7 +507,7 @@ def render_app() -> None:
     st.title("Equity fundamental deep-dive & one-page memo generator")
     st.caption(
         "Deterministic pure-Python valuation engine, Reverse DCF, and strictly grounded "
-        "local LLM synthesis (zero financial hallucination)."
+        f"hybrid LLM synthesis (zero financial hallucination) · {AUTHOR_ATTRIBUTION}"
     )
 
     with st.sidebar:
@@ -460,19 +586,152 @@ def render_app() -> None:
             )
         )
 
-        st.subheader("Local LLM configuration")
-        selected_model_raw = st.selectbox(
-            "Analysis model",
-            options=list(MODEL_OPTIONS),
-            index=0,
-            help="Select the local Ollama/MLX model used to synthesize the one-page memo.",
+        st.subheader("Narrative Synthesis")
+        enable_ai_synthesis = st.checkbox(
+            "Enable AI Narrative Synthesis (Ollama / Cloud API)",
+            key="enable_ai_synthesis",
+            help=(
+                "Auto-enabled when local Ollama responds on localhost:11434 or a GROQ_API_KEY "
+                "secret is configured. Leave unchecked for instant Zero-LLM Deterministic Rule "
+                "Engine mode."
+            ),
         )
-        selected_model = selected_model_raw if selected_model_raw is not None else MODEL_OPTIONS[0]
-        base_url = st.text_input(
-            "OpenAI-compatible base URL",
-            value=DEFAULT_BASE_URL,
-            help="Default Ollama endpoint: http://localhost:11434/v1 (MLX: http://localhost:8080/v1).",
-        ).strip()
+        with st.expander("LLM Endpoint & Model Settings", expanded=False):
+            provider_raw = st.selectbox(
+                "LLM Provider",
+                options=list(LLM_PROVIDERS),
+                key="llm_provider",
+                help=(
+                    "Switch between Groq Cloud Free Tier, Local Ollama, or any custom "
+                    "OpenAI-compatible endpoint."
+                ),
+            )
+            selected_provider = str(provider_raw) if provider_raw else PROVIDER_GROQ
+
+            if selected_provider == PROVIDER_GROQ:
+                base_url = st.text_input(
+                    "Base URL",
+                    value=GROQ_BASE_URL,
+                    key="groq_base_url",
+                    disabled=True,
+                    help="Groq OpenAI-compatible Chat Completions endpoint.",
+                ).strip()
+                groq_preset_raw = st.selectbox(
+                    "Model",
+                    options=list(GROQ_MODEL_PRESETS),
+                    index=0,
+                    key="groq_model_preset",
+                    help=(
+                        "Curated Groq free-tier models: llama-3.3-70b-versatile (recommended), "
+                        "llama-3.1-8b-instant (fastest / high rate-limit), qwen/qwen3-32b."
+                    ),
+                )
+                groq_preset = (
+                    str(groq_preset_raw).strip() if groq_preset_raw else GROQ_MODEL_PRESETS[0]
+                )
+                if groq_preset == GROQ_CUSTOM_MODEL_OPTION:
+                    custom_groq_model = st.text_input(
+                        "Custom Groq Model ID",
+                        value="",
+                        key="groq_custom_model",
+                        placeholder="e.g. mixtral-8x7b-32768",
+                        help="Enter any valid Groq model slug.",
+                    ).strip()
+                    selected_model = custom_groq_model or GROQ_MODEL_PRESETS[0]
+                else:
+                    selected_model = groq_preset
+
+                groq_key_input = st.text_input(
+                    "Groq API Key",
+                    value="",
+                    type="password",
+                    key="groq_api_key",
+                    placeholder="gsk_...",
+                    help=(
+                        "Paste your free Groq API key (gsk_...). If left blank, falls back to "
+                        "st.secrets['GROQ_API_KEY'] or the GROQ_API_KEY environment variable."
+                    ),
+                )
+                api_key, key_from_secret = resolve_provider_api_key(
+                    PROVIDER_GROQ,
+                    groq_key_input,
+                    secrets_lookup=_lookup_streamlit_secret,
+                )
+                if key_from_secret:
+                    st.caption("Using configured `GROQ_API_KEY` secret.")
+                elif enable_ai_synthesis and not api_key:
+                    st.warning(
+                        "Paste a Groq API key (`gsk_...`), configure `GROQ_API_KEY` in "
+                        "Streamlit Secrets, or uncheck **Enable AI Narrative Synthesis** for "
+                        "instant Zero-LLM Deterministic Rule Engine mode."
+                    )
+            elif selected_provider == PROVIDER_OLLAMA:
+                base_url = st.text_input(
+                    "Base URL",
+                    value=DEFAULT_BASE_URL,
+                    key="ollama_base_url",
+                    help="Local Ollama: http://localhost:11434/v1 | MLX: http://localhost:8080/v1",
+                ).strip()
+                ollama_model_raw = st.selectbox(
+                    "Model",
+                    options=list(OLLAMA_MODEL_PRESETS),
+                    index=0,
+                    accept_new_options=True,
+                    key="ollama_model",
+                    help="Select a local Ollama/MLX preset or type any custom model tag.",
+                )
+                selected_model = (
+                    str(ollama_model_raw).strip()
+                    if ollama_model_raw is not None and str(ollama_model_raw).strip()
+                    else OLLAMA_DEFAULT_MODEL
+                )
+                ollama_key_input = st.text_input(
+                    "API Key",
+                    value="",
+                    type="password",
+                    key="ollama_api_key",
+                    placeholder="Optional (defaults to 'ollama')",
+                    help="Optional for local Ollama servers; defaults internally to 'ollama'.",
+                )
+                api_key, _ = resolve_provider_api_key(
+                    PROVIDER_OLLAMA,
+                    ollama_key_input,
+                    secrets_lookup=_lookup_streamlit_secret,
+                )
+            else:
+                base_url = st.text_input(
+                    "Base URL",
+                    value=DEFAULT_BASE_URL,
+                    key="custom_base_url",
+                    help="Any OpenAI-compatible Chat Completions endpoint URL.",
+                ).strip()
+                custom_model_input = st.text_input(
+                    "Model",
+                    value=MODEL_OPTIONS[0],
+                    key="custom_model",
+                    help="Model identifier expected by your OpenAI-compatible endpoint.",
+                ).strip()
+                selected_model = custom_model_input or MODEL_OPTIONS[0]
+                custom_key_input = st.text_input(
+                    "API Key",
+                    value="",
+                    type="password",
+                    key="custom_api_key",
+                    placeholder="sk-...",
+                    help="Reads st.secrets['LLM_API_KEY'] or LLM_API_KEY env var when blank.",
+                )
+                api_key, key_from_secret = resolve_provider_api_key(
+                    PROVIDER_CUSTOM,
+                    custom_key_input,
+                    secrets_lookup=_lookup_streamlit_secret,
+                )
+                if key_from_secret:
+                    st.caption("Using configured `LLM_API_KEY` secret.")
+                elif enable_ai_synthesis and not api_key and "localhost" not in base_url:
+                    st.warning(
+                        "Enter an API key for your custom cloud endpoint or uncheck "
+                        "**Enable AI Narrative Synthesis** for Zero-LLM mode."
+                    )
 
         st.subheader("Data & offline mode")
         use_mock_data = st.checkbox(
@@ -480,13 +739,6 @@ def render_app() -> None:
             value=False,
             help="Run deterministically offline using bundled fixture data without network calls.",
         )
-        use_live_llm = False
-        if use_mock_data:
-            use_live_llm = st.checkbox(
-                "Use live local LLM with mock data",
-                value=False,
-                help="Keep offline mock financials but call the selected local LLM for prose.",
-            )
 
         run_button = st.button(
             "Generate one-page memo",
@@ -495,6 +747,9 @@ def render_app() -> None:
             on_click=_switch_to_deep_dive_mode,
             width="stretch",
         )
+
+        st.divider()
+        st.caption(AUTHOR_ATTRIBUTION)
 
     selected_mode = st.segmented_control(
         "Workspace mode",
@@ -514,6 +769,7 @@ def render_app() -> None:
             exit_ev_ebitda=exit_ev_ebitda,
             use_mock_data=use_mock_data,
         )
+        _render_page_footer()
         return
 
     should_run_deep_dive = run_button or bool(st.session_state.pop("auto_run_deep_dive", False))
@@ -524,6 +780,11 @@ def render_app() -> None:
         peer_list = parse_peer_tickers(peers_input)
         with st.spinner(f"Running fundamental analysis for {ticker_input}..."):
             try:
+                preloaded_bundle, data_notice = _fetch_bundle_with_cloud_fallback(
+                    ticker_input,
+                    peer_list,
+                    use_mock_data=use_mock_data,
+                )
                 result = run_memo_pipeline(
                     ticker=ticker_input,
                     peers=peer_list,
@@ -534,15 +795,18 @@ def render_app() -> None:
                     model=selected_model,
                     base_url=base_url or DEFAULT_BASE_URL,
                     mock_data=use_mock_data,
-                    live_llm=use_live_llm,
                     max_retries=3,
+                    use_ai_synthesis=enable_ai_synthesis,
+                    api_key=api_key,
+                    allow_llm_fallback=True,
+                    preloaded_bundle=preloaded_bundle,
+                    data_fallback_notice=data_notice,
                 )
             except (FundamentalMemoError, ValueError) as exc:
                 st.error(
                     f"Analysis failed: {exc}\n\n"
                     "Troubleshooting: verify your ticker symbol and DCF inputs (WACC > terminal "
-                    "growth), confirm your local Ollama/MLX server is running at the configured "
-                    "Base URL, or enable 'Use Offline Mock Data' for a deterministic offline run."
+                    "growth), or enable 'Use Offline Mock Data' for a deterministic offline run."
                 )
                 return
             except Exception as exc:  # noqa: BLE001
@@ -555,10 +819,16 @@ def render_app() -> None:
     stored_result: PipelineResult | None = st.session_state.get("last_pipeline_result")
     if stored_result is None:
         st.info(
-            "Configure your target ticker, peers, DCF assumptions, and local model in the sidebar, "
+            "Configure your target ticker, peers, and DCF assumptions in the sidebar, "
             "then click **Generate one-page memo**."
         )
+        _render_page_footer()
         return
+
+    if stored_result.data_fallback_notice:
+        st.warning(stored_result.data_fallback_notice, icon=":material/cloud_off:")
+    if stored_result.fallback_notice and stored_result.fallback_severity == "warning":
+        st.warning(stored_result.fallback_notice, icon=":material/warning:")
 
     valuation = stored_result.valuation
     snapshot = stored_result.snapshot
@@ -716,15 +986,13 @@ def render_app() -> None:
             else:
                 st.caption("Quarterly statement data was unavailable for this ticker.")
 
-    synth_label = (
-        "Offline Deterministic Mock"
-        if stored_result.used_mock_llm
-        else str(st.session_state.get("last_selected_model", MODEL_OPTIONS[0]))
-    )
+    synth_label = stored_result.synthesis_mode
     st.caption(
         f"Word Count: **{stored_result.word_count} / {MAX_MEMO_WORDS}** | "
-        f"Synthesizer: **{synth_label}** | Grounding Audit: **Passed**"
+        f"Mode: **{synth_label}** | Grounding Audit: **Passed**"
     )
+    if stored_result.fallback_notice and stored_result.fallback_severity != "warning":
+        st.caption(f"*{stored_result.fallback_notice}*")
 
     html_report = build_html_report(
         snapshot,
@@ -761,6 +1029,8 @@ def render_app() -> None:
 
     with st.expander("Verified Quantitative Data (Audit Trail JSON)"):
         st.json(stored_result.audit_trail_json())
+
+    _render_page_footer()
 
 
 if __name__ == "__main__":

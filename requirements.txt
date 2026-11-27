@@ -1,0 +1,10 @@
+streamlit>=1.38.0
+yfinance>=0.2.48
+pandas>=2.2.0
+numpy>=1.26.0
+scipy>=1.13.0
+plotly>=5.24.0
+pydantic>=2.8.0
+openai>=1.45.0
+markdown>=3.7
+-e ./fundamental_memo

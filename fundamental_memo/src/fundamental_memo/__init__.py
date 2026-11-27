@@ -1,5 +1,25 @@
 """Deterministic equity fundamental analysis and one-page investment memo generator."""
 
+from fundamental_memo.deterministic_memo import (
+    DETERMINISTIC_MODE_LABEL,
+    GROQ_BASE_URL,
+    GROQ_CUSTOM_MODEL_OPTION,
+    GROQ_MODEL_PRESETS,
+    HYBRID_MODEL_PRESETS,
+    LLM_PROVIDERS,
+    OLLAMA_DEFAULT_MODEL,
+    OLLAMA_MODEL_PRESETS,
+    PROVIDER_CUSTOM,
+    PROVIDER_GROQ,
+    PROVIDER_OLLAMA,
+    MemoGenerationOutcome,
+    build_deterministic_memo,
+    build_deterministic_memo_schema,
+    generate_memo,
+    is_localhost_url,
+    probe_local_llm_endpoint,
+    resolve_provider_api_key,
+)
 from fundamental_memo.html_exporter import build_html_report
 from fundamental_memo.memo_synthesizer import DEFAULT_BASE_URL, DEFAULT_MODEL, SUPPORTED_MODELS
 from fundamental_memo.schemas import (
@@ -27,6 +47,17 @@ from fundamental_memo.screener import run_watchlist_scan
 __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
+    "DETERMINISTIC_MODE_LABEL",
+    "GROQ_BASE_URL",
+    "GROQ_CUSTOM_MODEL_OPTION",
+    "GROQ_MODEL_PRESETS",
+    "HYBRID_MODEL_PRESETS",
+    "LLM_PROVIDERS",
+    "OLLAMA_DEFAULT_MODEL",
+    "OLLAMA_MODEL_PRESETS",
+    "PROVIDER_CUSTOM",
+    "PROVIDER_GROQ",
+    "PROVIDER_OLLAMA",
     "SUPPORTED_MODELS",
     "DataFetchError",
     "DcfSensitivity",
@@ -38,6 +69,7 @@ __all__ = [
     "InvestmentMemoOutput",
     "InvestmentMemoSchema",
     "MarketDataBundle",
+    "MemoGenerationOutcome",
     "MemoWordLimitError",
     "NegativeFreeCashFlowError",
     "PeerComparable",
@@ -47,7 +79,13 @@ __all__ = [
     "ValuationError",
     "WorkingCapitalMetrics",
     "__version__",
+    "build_deterministic_memo",
+    "build_deterministic_memo_schema",
     "build_html_report",
+    "generate_memo",
+    "is_localhost_url",
+    "probe_local_llm_endpoint",
+    "resolve_provider_api_key",
     "run_watchlist_scan",
 ]
 

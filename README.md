@@ -35,7 +35,17 @@ mypy src tests
 streamlit run src/fundamental_memo/streamlit_app.py
 ```
 
-- **No local LLM required to test immediately:** enable **Use Offline Mock Data** in the sidebar (or switch to **Watchlist Quick-Scan Screener** to screen live tickers in pure Python without Ollama/MLX).
-- **With local Ollama:** ensure Ollama is running at `http://localhost:11434/v1` and pull one of the configured models (`inkling-2-mini:latest`, `gemma4:31b-mlx`, or `qwen3.8:27b-mlx`).
+- **No local LLM required (Hybrid Cloud-Ready Mode):** When `localhost:11434` is not running (e.g., on Streamlit Community Cloud), **Enable AI Narrative Synthesis** defaults to off and the pure-Python **Deterministic Rule Engine (Zero-LLM)** generates a complete, grounded one-page memo + interactive Plotly charts + `.md`/`.html` exports in under 2 seconds.
+- **With local Ollama:** Start Ollama at `http://localhost:11434/v1` — the app auto-detects it and enables AI synthesis automatically (`qwen3.8:27b-mlx`, `inkling-2-mini:latest`, `gemma4:31b-mlx`, `gemma4:26b-mlx`).
+- **With Cloud API (BYOK):** Open **LLM Endpoint & Model Settings** in the sidebar to supply a Groq/OpenRouter/OpenAI Base URL, model ID (e.g., `llama-3.3-70b-versatile`), and API Key (or set `LLM_API_KEY` in Streamlit Secrets).
+
+## Deploy to Streamlit Community Cloud
+
+1. Push this repository to GitHub (root `requirements.txt` and `.streamlit/config.toml` are preconfigured).
+2. On [share.streamlit.io](https://share.streamlit.io/), create a new app pointing to:
+   - **Repository:** `youyouma-n8n/fundamental-memo-generator`
+   - **Branch:** `main`
+   - **Main file path:** `fundamental_memo/src/fundamental_memo/streamlit_app.py`
+3. *(Optional)* Add `LLM_API_KEY = "..."` in **App Settings → Secrets** if you want cloud AI narrative synthesis enabled by default. Without any secrets, the app runs instantaneously in **Deterministic Rule Engine (Zero-LLM)** mode with 1-hour `yfinance` caching and automatic offline demo fallback.
 
 See [fundamental_memo/README.md](fundamental_memo/README.md) for CLI flags and full module architecture.

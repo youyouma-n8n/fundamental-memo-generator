@@ -7,15 +7,17 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fundamental_memo.data_fetcher import fetch_market_data
+from fundamental_memo.deterministic_memo import (
+    DETERMINISTIC_MODE_LABEL,
+    generate_memo,
+)
 from fundamental_memo.memo_synthesizer import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
     build_audit_trail_payload,
-    synthesize_memo_with_llm,
-    synthesize_mock_memo,
 )
 from fundamental_memo.renderer import render_investment_memo
 from fundamental_memo.schemas import (
@@ -23,6 +25,7 @@ from fundamental_memo.schemas import (
     FinancialSnapshot,
     FundamentalMemoError,
     InvestmentMemoSchema,
+    MarketDataBundle,
     PeerComparable,
     ValuationAnalysis,
     count_words,
@@ -48,6 +51,10 @@ class PipelineResult:
     markdown: str
     word_count: int
     used_mock_llm: bool
+    synthesis_mode: str = DETERMINISTIC_MODE_LABEL
+    fallback_notice: str | None = None
+    fallback_severity: Literal["caption", "warning"] = "caption"
+    data_fallback_notice: str | None = None
 
     def audit_trail_json(self) -> dict[str, Any]:
         """Return the canonical Audit Trail JSON payload for export and UI display."""
@@ -82,19 +89,28 @@ def run_memo_pipeline(
     fixture_path: Path | None = None,
     live_llm: bool = False,
     max_retries: int = 2,
+    use_ai_synthesis: bool | None = None,
+    api_key: str = "",
+    allow_llm_fallback: bool = False,
+    preloaded_bundle: MarketDataBundle | None = None,
+    data_fallback_notice: str | None = None,
 ) -> PipelineResult:
-    """Execute fetch -> quantitative valuation -> synthesis -> grounded Markdown rendering."""
+    """Execute fetch -> quantitative valuation -> hybrid synthesis -> grounded Markdown render."""
     target_symbol = ticker.strip().upper()
     filtered_peers = [
         peer.strip().upper()
         for peer in peers
         if peer.strip() and peer.strip().upper() != target_symbol
     ]
-    bundle = fetch_market_data(
-        ticker=target_symbol,
-        peer_tickers=filtered_peers,
-        mock_data=mock_data,
-        fixture_path=fixture_path,
+    bundle = (
+        preloaded_bundle
+        if preloaded_bundle is not None
+        else fetch_market_data(
+            ticker=target_symbol,
+            peer_tickers=filtered_peers,
+            mock_data=mock_data,
+            fixture_path=fixture_path,
+        )
     )
     valuation = run_valuation_analysis(
         bundle.snapshot,
@@ -111,25 +127,27 @@ def run_memo_pipeline(
         fcf_cagr_override=valuation.dcf_assumptions["fcf_cagr"],
     )
 
-    use_mock_llm = mock_data and not live_llm
-    if use_mock_llm:
-        memo_output = synthesize_mock_memo(bundle.snapshot, valuation, bundle.peers)
-    else:
-        memo_output = synthesize_memo_with_llm(
-            bundle.snapshot,
-            valuation,
-            bundle.peers,
-            sensitivity=sensitivity,
-            model=model,
-            base_url=base_url,
-            max_retries=max_retries,
-        )
+    resolved_use_ai = (
+        use_ai_synthesis if use_ai_synthesis is not None else not (mock_data and not live_llm)
+    )
+    outcome = generate_memo(
+        bundle.snapshot,
+        valuation,
+        bundle.peers,
+        sensitivity=sensitivity,
+        use_ai_synthesis=resolved_use_ai,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        max_retries=max_retries,
+        allow_fallback=allow_llm_fallback,
+    )
 
     markdown = render_investment_memo(
         bundle.snapshot,
         valuation,
         bundle.peers,
-        memo_output,
+        outcome.memo_output,
         sensitivity=sensitivity,
     )
     return PipelineResult(
@@ -137,10 +155,14 @@ def run_memo_pipeline(
         peers=bundle.peers,
         valuation=valuation,
         sensitivity=sensitivity,
-        memo_output=memo_output,
+        memo_output=outcome.memo_output,
         markdown=markdown,
         word_count=count_words(markdown),
-        used_mock_llm=use_mock_llm,
+        used_mock_llm=outcome.used_deterministic,
+        synthesis_mode=outcome.mode_label,
+        fallback_notice=outcome.fallback_notice,
+        fallback_severity=outcome.fallback_severity,
+        data_fallback_notice=data_fallback_notice,
     )
 
 
